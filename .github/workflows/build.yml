@@ -8,6 +8,8 @@ on:
 
 env:
   dotnet-version: 9.0
+  tool-sdk-version: 10.0
+  tool-version: 0.0.0-ci.${{ github.run_number }}
 
 jobs:
   build-windows:
@@ -107,3 +109,90 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.output }}
+
+  build-tool:
+    needs:
+      - build-windows
+      - build-ubuntu
+      - build-macos
+      - build-debian
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.tool-sdk-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libfuzzer-dotnet-*
+          path: artifacts/native
+          merge-multiple: true
+      - name: Pack .NET tool
+        shell: pwsh
+        run: |
+          dotnet msbuild src/LibFuzzer.DotNet.Tool `
+            -t:PackTool `
+            -p:Configuration=Release `
+            -p:ToolPackageVersion=${{ env.tool-version }} `
+            -p:NativeArtifactsPath="$PWD/artifacts/native" `
+            -p:PackageOutputPath="$PWD/artifacts/package"
+      - name: Test .NET tool
+        shell: pwsh
+        run: |
+          $toolPath = Join-Path $PWD ".tools"
+          dotnet tool install `
+            --tool-path $toolPath `
+            --add-source artifacts/package `
+            --version ${{ env.tool-version }} `
+            libfuzzer-dotnet
+          $env:PATH = "$toolPath$([IO.Path]::PathSeparator)$env:PATH"
+          ./test.ps1 -LibFuzzer dotnet-libfuzzer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libfuzzer-dotnet-nuget
+          path: artifacts/package/*.nupkg
+
+  test-tool:
+    needs: build-tool
+    strategy:
+      matrix:
+        runner:
+          - windows-latest
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-15
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.tool-sdk-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: libfuzzer-dotnet-nuget
+          path: artifacts/package
+      - name: Test .NET tool commands
+        shell: pwsh
+        run: |
+          $toolPath = Join-Path $PWD ".tools"
+          dotnet tool install `
+            --tool-path $toolPath `
+            --add-source artifacts/package `
+            --version ${{ env.tool-version }} `
+            libfuzzer-dotnet
+
+          $env:PATH = "$toolPath$([IO.Path]::PathSeparator)$env:PATH"
+          $directOutput = (dotnet-libfuzzer 2>&1) -join [Environment]::NewLine
+
+          if ($LASTEXITCODE -ne 1 -or -not $directOutput.Contains("You must specify the target path")) {
+            throw "Direct tool invocation failed: $directOutput"
+          }
+
+          $dotnetOutput = (dotnet libfuzzer 2>&1) -join [Environment]::NewLine
+
+          if ($LASTEXITCODE -ne 1 -or -not $dotnetOutput.Contains("You must specify the target path")) {
+            throw "dotnet tool invocation failed: $dotnetOutput"
+          }
